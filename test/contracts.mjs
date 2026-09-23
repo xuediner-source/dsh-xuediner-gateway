@@ -24,6 +24,12 @@ check('gateway go module renamed', read('gateway/go.mod').includes('xuediner-sou
 const mustExist = ['src/index.ts', 'src/adapter.ts', 'src/pool-hub.ts', 'src/zcode.ts', 'src/qoder.ts', 'src/codex.ts', 'client/index.js', 'scripts/login-codearts.mjs', 'scripts/pool-report.mjs', 'gateway/cmd/server/main.go', 'gateway/config.example.json', 'README.md', 'LICENSE', '.gitignore', 'cordis.patch.yml'];
 for (const f of mustExist) check(`exists ${f}`, fs.existsSync(path.join(ROOT, f)));
 
+// Every //go:embed target must exist AND be tracked by git, or a fresh clone
+// cannot compile (the gateway .gitignore has a broad *.md rule).
+check('go:embed prompt asset exists', fs.existsSync(path.join(ROOT, 'gateway/internal/prompt/defaultprompt.md')));
+check('gateway .gitignore un-ignores the embed asset', read('gateway/.gitignore').includes('!internal/prompt/defaultprompt.md'));
+check('go:embed html/js assets exist', fs.existsSync(path.join(ROOT, 'gateway/internal/panel/index.html')) && fs.existsSync(path.join(ROOT, 'gateway/internal/panel/app.js')));
+
 const srcFiles = fs.readdirSync(path.join(ROOT, 'src')).filter((f) => f.endsWith('.ts'));
 let absLeak = [];
 for (const f of srcFiles) {
