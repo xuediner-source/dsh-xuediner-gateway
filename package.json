@@ -16,7 +16,7 @@
   ],
   "exports": {
     ".": "./lib/index.js",
-    "./client": "./client/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -31,7 +31,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-client.mjs",
     "prepare": "pnpm build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pool": "node scripts/pool-report.mjs"

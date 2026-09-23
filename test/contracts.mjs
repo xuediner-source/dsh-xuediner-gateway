@@ -13,7 +13,10 @@ function check(name, cond, hint = '') {
 function read(p) { return fs.readFileSync(path.join(ROOT, p), 'utf8'); }
 
 console.log('[contracts]');
-check('package name is dsh-xuediner-gateway', JSON.parse(read('package.json')).name === 'dsh-xuediner-gateway');
+const pkg = JSON.parse(read('package.json'));
+check('package name is dsh-xuediner-gateway', pkg.name === 'dsh-xuediner-gateway');
+check('client export resolves to lib/client.js', pkg.exports['./client'] === './lib/client.js');
+check('build copies the client bundle', pkg.scripts.build.includes('copy-client.mjs'));
 check('cordis patch inserts xuediner-gateway', read('cordis.patch.yml').includes('xuediner-gateway'));
 check('client module id is dsh-xuediner-gateway', read('client/index.js').includes('id: "dsh-xuediner-gateway"'));
 check('gateway go module renamed', read('gateway/go.mod').includes('xuediner-source/dsh-xuediner-gateway/gateway'));
