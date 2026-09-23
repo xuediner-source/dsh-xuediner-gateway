@@ -20,6 +20,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
   LlmAdapter,
@@ -88,6 +89,13 @@ import {
   codexChat,
   type CodexAccount,
 } from './codex.js';
+import {
+  COMMANDCODE_MODELS,
+  commandCodeChat,
+  findCommandCodeModel,
+  resolveCommandCodeKey,
+} from './commandcode.js';
+import type { CommandCodeTool } from './commandcode.js';
 import { recordCodeArtsUsage } from './codearts-usage.js';
 
 /** OpenRouter free-model ids are prefixed so routing can recognize them. */
@@ -98,6 +106,13 @@ export const LLM7_PREFIX = 'l7/';
 export const GROQ_PREFIX = 'groq/';
 /** Zhipu model ids are prefixed for the same reason. */
 export const ZHIPU_PREFIX = 'zp/';
+
+/**
+ * Command Code Go model ids are prefixed for the same reason. Their upstream
+ * ids are already slash-namespaced (`meta/muse-spark-1.3-contributor`), so
+ * without a prefix they could collide with other routing namespaces.
+ */
+export const COMMANDCODE_PREFIX = 'cc/';
 
 /**
  * 9Router model ids are prefixed for the same reason. 9Router's own ids are
@@ -132,6 +147,16 @@ export function isGroqModel(uiModel: string): boolean {
 
 export function isZhipuModel(uiModel: string): boolean {
   return uiModel.startsWith(ZHIPU_PREFIX);
+}
+
+/** Whether a picker model id routes to Command Code Go. */
+export function isCommandCodeModel(uiModel: string): boolean {
+  return uiModel.startsWith(COMMANDCODE_PREFIX);
+}
+
+/** Strip the routing prefix to obtain the upstream CommandCode model id. */
+export function commandCodeUpstreamId(uiModel: string): string {
+  return uiModel.startsWith(COMMANDCODE_PREFIX) ? uiModel.slice(COMMANDCODE_PREFIX.length) : uiModel;
 }
 
 /**
@@ -471,6 +496,104 @@ function serializeMessages(
     }
   }
   return sanitizeOpenAiWireMessages(wire);
+}
+
+/**
+ * Convert harness messages into CommandCode's own parts format.
+ *
+ * CommandCode does not accept OpenAI `tool_calls` / `tool_call_id`; it expects
+ * typed content parts: assistant turns carry `text` / `reasoning` / `tool-call`
+ * parts, tool results arrive as `tool-result` parts on a `tool` role, and user
+ * turns carry `text` / `image` parts.
+ *
+ * Returns the wire messages plus a call-id -> tool-name map, because tool
+ * results identify their call by id only.
+ */
+function commandCodeMessages(
+  messages: readonly Message[],
+  imageUrls?: Map<string, string>,
+): { messages: Array<Record<string, unknown>>; toolNames: Map<string, string> } {
+  const toolNames = new Map<string, string>();
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue;
+    const content = Array.isArray(message.content) ? message.content : [];
+    for (const block of content) {
+      if (typeof block !== 'object' || block === null) continue;
+      if ((block as { type?: string }).type === 'tool-call') {
+        const id = String((block as { id?: unknown }).id ?? '');
+        const name = String((block as { name?: unknown }).name ?? '');
+        if (id !== '') toolNames.set(id, name);
+      }
+    }
+  }
+
+  const wire: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    // The system prompt travels in params.system, not as a message.
+    if (message.role === 'system') continue;
+
+    if (message.role === 'assistant') {
+      const content = Array.isArray(message.content) ? message.content : [];
+      const parts: Array<Record<string, unknown>> = [];
+      for (const block of content) {
+        if (typeof block !== 'object' || block === null) continue;
+        const type = (block as { type?: string }).type;
+        if (type === 'text') {
+          const text = String((block as { text?: unknown }).text ?? '');
+          if (text.length > 0) parts.push({ type: 'text', text });
+        } else if (type === 'reasoning') {
+          const text = String((block as { text?: unknown }).text ?? '');
+          if (text.length > 0) parts.push({ type: 'reasoning', text });
+        } else if (type === 'tool-call') {
+          const raw = String((block as { arguments?: unknown }).arguments ?? '');
+          let input: unknown = {};
+          try {
+            input = raw.trim() === '' ? {} : JSON.parse(raw);
+          } catch {
+            input = {};
+          }
+          parts.push({
+            type: 'tool-call',
+            toolCallId: String((block as { id?: unknown }).id ?? ''),
+            toolName: String((block as { name?: unknown }).name ?? ''),
+            input,
+          });
+        }
+      }
+      if (parts.length > 0) wire.push({ role: 'assistant', content: parts });
+      continue;
+    }
+
+    const content = Array.isArray(message.content) ? message.content : [];
+    const toolResults = content.filter(
+      (block) => typeof block === 'object' && block !== null && (block as { type?: string }).type === 'tool-result',
+    );
+    for (const result of toolResults) {
+      const callId = String((result as { toolCallId?: unknown }).toolCallId ?? '');
+      const isError = (result as { isError?: unknown }).isError === true;
+      const value = contentToText((result as { content?: unknown }).content);
+      wire.push({
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: callId,
+            toolName: toolNames.get(callId) ?? 'tool',
+            output: { type: isError ? 'error-text' : 'text', value: value || '(empty result)' },
+          },
+        ],
+      });
+    }
+
+    const parts = userContentParts(content, imageUrls ?? new Map());
+    if (parts !== undefined) {
+      wire.push({ role: 'user', content: parts });
+    } else {
+      const text = contentToText(message.content);
+      if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text });
+    }
+  }
+  return { messages: wire, toolNames };
 }
 
 /**
@@ -847,6 +970,7 @@ export class XuedinerApiAdapter extends LlmAdapter {
     // Qoder is direct, so its availability depends on a resolvable credential
     // rather than on 9Router being up.
     const qoderCredentialAvailable = (await resolveQoderCredential()) !== undefined;
+    const commandCodeCredentialAvailable = resolveCommandCodeKey() !== undefined;
     const native: LlmModelInfo[] = [
       {
         provider: PROVIDER,
@@ -929,6 +1053,20 @@ export class XuedinerApiAdapter extends LlmAdapter {
           }))
         : [];
 
+    // Command Code Go: a subscription plan behind its own `/alpha/generate`
+    // protocol. Advertised only when a credential resolves, so a logged-out
+    // state leaves no dead entry in the picker.
+    const commandCodeModels: LlmModelInfo[] =
+      commandCodeCredentialAvailable
+        ? COMMANDCODE_MODELS.map((m) => ({
+            provider: PROVIDER,
+            id: `${COMMANDCODE_PREFIX}${m.id}`,
+            name: m.name,
+            description: m.description,
+            inputModalities: m.supportsImage ? (['text', 'image'] as const) : (['text'] as const),
+          }))
+        : [];
+
     // Z.AI / BigModel coding-plan models, served through the LOCAL zcode-proxy
     // (TriDefender/zcode-api). The plan quota is not reachable via the public
     // API hosts — they answer `1113 Insufficient balance` even with the plan's
@@ -989,7 +1127,7 @@ export class XuedinerApiAdapter extends LlmAdapter {
               })),
           ];
 
-    return [...native, ...qoderModels, ...zcodeModels, ...nineRouterModels];
+    return [...native, ...qoderModels, ...commandCodeModels, ...zcodeModels, ...nineRouterModels];
   }
 
   /**
@@ -1125,6 +1263,25 @@ export class XuedinerApiAdapter extends LlmAdapter {
         reasoning: {
           efforts: ['low', 'medium', 'high', 'xhigh'].map((id) => ({ id: ReasoningEffortId(id), name: id })),
           defaultEffort: ReasoningEffortId('high'),
+        },
+      };
+    }
+
+    // Command Code Go: first-class entries over the `/alpha/generate` protocol.
+    if (isCommandCodeModel(model)) {
+      const hit = findCommandCodeModel(commandCodeUpstreamId(model));
+      return {
+        provider: provider || PROVIDER,
+        id: model,
+        name: hit.name,
+        description: hit.description,
+        inputModalities: hit.supportsImage ? ['text', 'image'] : ['text'],
+        context: { contextWindow: hit.contextWindow },
+        defaultMaxTokens: hit.maxTokens,
+        // The plan accepts its own effort ladder (verified in dsh-subs-hub).
+        reasoning: {
+          efforts: hit.efforts.map((id) => ({ id: ReasoningEffortId(id), name: id })),
+          defaultEffort: ReasoningEffortId(hit.defaultEffort),
         },
       };
     }
@@ -1324,6 +1481,12 @@ export class XuedinerApiAdapter extends LlmAdapter {
     }
     if (isZhipuModel(options.model)) {
       yield* this.zhipuStream(options);
+      return;
+    }
+
+    // Route 0b-1c: Command Code Go (subscription; own /alpha/generate protocol).
+    if (isCommandCodeModel(options.model)) {
+      yield* this.commandCodeStream(options);
       return;
     }
 
@@ -1708,6 +1871,287 @@ export class XuedinerApiAdapter extends LlmAdapter {
     }
 
     yield* this.consumeSse(response, options);
+  }
+
+  /**
+   * Command Code Go route.
+   *
+   * Not OpenAI-shaped: messages go out in CommandCode's own parts format and
+   * the response is a custom event stream, so this route converts both ways.
+   * The transport lives in commandcode.ts.
+   */
+  private async *commandCodeStream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const apiKey = resolveCommandCodeKey();
+    if (!apiKey) {
+      throw new LlmError(
+        'xuedinerAPI: Command Code Go 未登录。请先执行 `commandcode` CLI 登录，'
+        + '或把 COMMANDCODE_API_KEY 写入环境变量 / ~/.dsh/.credentials.yaml。',
+        'MISSING_CREDENTIAL',
+      );
+    }
+
+    const upstream = findCommandCodeModel(commandCodeUpstreamId(options.model));
+    const imageUrls = await this.resolveImageUrls(options.messages);
+    const { messages, toolNames } = commandCodeMessages(options.messages, imageUrls);
+    const tools: CommandCodeTool[] | undefined = options.tools?.map((tool) => ({
+      type: 'function',
+      name: tool.name,
+      description: tool.description ?? '',
+      input_schema: (tool.parameters ?? { type: 'object', properties: {} }) as Record<string, unknown>,
+    }));
+
+    logDebug(`commandCodeStream: model=${upstream.id} (ui=${options.model}) messages=${messages.length}`);
+
+    let response: Response;
+    try {
+      response = await commandCodeChat(
+        apiKey,
+        {
+          model: upstream.id,
+          messages,
+          system: options.system ?? '',
+          ...(tools !== undefined && tools.length > 0 ? { tools } : {}),
+          ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+          ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+          ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
+          threadId: randomUUID(),
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+        this.fetchImpl,
+      );
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw new LlmError(`xuedinerAPI: Command Code Go transport error: ${errorMessage(error)}`, 'TRANSPORT', {
+        cause: error,
+      });
+    }
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      const error = new LlmError(
+        `xuedinerAPI: Command Code Go ${errorDetail(errText)}`,
+        response.status === 401 || response.status === 403
+          ? 'INVALID_CREDENTIAL'
+          : httpErrorCode(response.status, errText),
+        { status: response.status },
+      );
+      (error as { status?: number }).status = response.status;
+      throw error;
+    }
+
+    yield* this.consumeCommandCodeSse(response, toolNames);
+  }
+
+  /**
+   * Consume CommandCode's own SSE event stream and translate it into harness
+   * chunks.
+   *
+   * Events handled (observed shape): `text-delta`, `reasoning-delta`,
+   * `tool-input-start`, `tool-input-delta`, `tool-call`, `finish-step`
+   * (usage), `finish` (stop reason). Tool-call blocks are opened lazily and
+   * closed exactly once; a call whose deltas never arrived is still closed
+   * from the final `tool-call` event, and anything still open at end-of-stream
+   * is closed so the harness never sees a dangling block.
+   */
+  private async *consumeCommandCodeSse(
+    response: Response,
+    toolNames: Map<string, string>,
+  ): AsyncIterable<StreamChunk> {
+    if (!response.body) throw new LlmError('xuedinerAPI: empty Command Code response body', 'EMPTY_RESPONSE');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let firstTokenReceived = false;
+    let textIndex = -1;
+    let text = '';
+    let reasoningIndex = -1;
+    let reasoning = '';
+    let nextIndex = 0;
+    let finishReason: string | undefined;
+    let sawToolCall = false;
+    const openBlocks = new Map<string, { index: number; name: string; args: string }>();
+    const closed = new Set<string>();
+
+    const alloc = (id: string, name: string): { index: number; name: string; args: string } => {
+      const known = openBlocks.get(id);
+      if (known !== undefined) return known;
+      const block = { index: nextIndex++, name, args: '' };
+      openBlocks.set(id, block);
+      return block;
+    };
+
+    try {
+      for (;;) {
+        const result = await readWithTimeout(
+          reader,
+          firstTokenReceived ? CHUNK_IDLE_TIMEOUT_MS : FIRST_TOKEN_TIMEOUT_MS,
+        );
+        if (result.done) break;
+        firstTokenReceived = true;
+        buffer += decoder.decode(result.value, { stream: true });
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newline).replace(/\r$/, '').trim();
+          buffer = buffer.slice(newline + 1);
+          if (line === '' || line.startsWith(':') || line.startsWith('event:')) continue;
+          const payload = line.startsWith('data:') ? line.slice(5).trim() : line;
+          if (payload === '' || payload === '[DONE]') continue;
+          let ev: {
+            type?: string;
+            text?: string;
+            delta?: string;
+            id?: string;
+            toolName?: string;
+            toolCallId?: string;
+            input?: unknown;
+            finishReason?: string;
+            usage?: {
+              inputTokens?: number;
+              outputTokens?: number;
+              cachedInputTokens?: number;
+              reasoningTokens?: number;
+            };
+          };
+          try {
+            ev = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+
+          if (ev.type === 'text-delta' && typeof ev.text === 'string') {
+            if (textIndex === -1) {
+              textIndex = nextIndex++;
+              yield { type: 'block-start', index: textIndex, blockType: 'text' };
+            }
+            text += ev.text;
+            yield { type: 'text-delta', index: textIndex, text: ev.text };
+            continue;
+          }
+
+          if (ev.type === 'reasoning-delta' && typeof ev.text === 'string') {
+            if (reasoningIndex === -1) {
+              reasoningIndex = nextIndex++;
+              yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' };
+            }
+            reasoning += ev.text;
+            yield { type: 'reasoning-delta', index: reasoningIndex, text: ev.text };
+            continue;
+          }
+
+          if (ev.type === 'tool-input-start') {
+            const id = typeof ev.id === 'string' && ev.id.length > 0 ? ev.id : `call_${Date.now().toString(36)}`;
+            const name = typeof ev.toolName === 'string' ? ev.toolName : (toolNames.get(id) ?? '');
+            const block = alloc(id, name);
+            sawToolCall = true;
+            yield { type: 'block-start', index: block.index, blockType: 'tool-call' };
+            if (name.length > 0) {
+              yield { type: 'tool-call-delta', index: block.index, id: ToolCallId(id), name, argumentsDelta: '' };
+            }
+            continue;
+          }
+
+          if (ev.type === 'tool-input-delta' && typeof ev.delta === 'string') {
+            const id = typeof ev.id === 'string' ? ev.id : '';
+            if (id === '') continue;
+            const block = alloc(id, toolNames.get(id) ?? '');
+            sawToolCall = true;
+            block.args += ev.delta;
+            yield {
+              type: 'tool-call-delta',
+              index: block.index,
+              id: ToolCallId(id),
+              ...(block.name.length > 0 ? { name: block.name } : {}),
+              argumentsDelta: ev.delta,
+            };
+            continue;
+          }
+
+          if (ev.type === 'tool-call') {
+            const id = typeof ev.toolCallId === 'string' && ev.toolCallId.length > 0
+              ? ev.toolCallId
+              : `call_${Date.now().toString(36)}`;
+            const name = typeof ev.toolName === 'string' ? ev.toolName : (toolNames.get(id) ?? '');
+            const args = JSON.stringify(ev.input ?? {});
+            const block = alloc(id, name);
+            sawToolCall = true;
+            // Only emit the deltas when this call never streamed its input.
+            if (!closed.has(id) && block.args === '') {
+              yield { type: 'block-start', index: block.index, blockType: 'tool-call' };
+              yield {
+                type: 'tool-call-delta',
+                index: block.index,
+                id: ToolCallId(id),
+                ...(name.length > 0 ? { name } : {}),
+                argumentsDelta: args,
+              };
+            }
+            if (!closed.has(id)) {
+              closed.add(id);
+              yield {
+                type: 'block-end',
+                index: block.index,
+                block: { type: 'tool-call', id: ToolCallId(id), name, arguments: args },
+              };
+            }
+            continue;
+          }
+
+          if (ev.type === 'finish-step' && ev.usage !== undefined && typeof ev.usage === 'object') {
+            const usage = ev.usage;
+            const input = Number(usage.inputTokens ?? 0);
+            const cached = Number(usage.cachedInputTokens ?? 0);
+            const reasoningTokens = Number(usage.reasoningTokens ?? 0);
+            yield {
+              type: 'usage',
+              usage: {
+                inputTokens: cached > 0 ? Math.max(0, input - cached) : input,
+                outputTokens: Number(usage.outputTokens ?? 0),
+                ...(cached > 0 ? { cacheReadTokens: cached } : {}),
+                ...(reasoningTokens > 0 ? { reasoningTokens } : {}),
+              },
+            };
+            continue;
+          }
+
+          if (ev.type === 'finish') {
+            finishReason = ev.finishReason;
+            continue;
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    if (textIndex !== -1) {
+      yield { type: 'block-end', index: textIndex, block: { type: 'text', text } };
+    }
+    if (reasoningIndex !== -1 && reasoning !== '') {
+      yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoning } };
+    }
+    for (const [id, block] of openBlocks) {
+      if (closed.has(id)) continue;
+      closed.add(id);
+      yield {
+        type: 'block-end',
+        index: block.index,
+        block: {
+          type: 'tool-call',
+          id: ToolCallId(id),
+          name: block.name,
+          arguments: normalizeToolArguments(block.args),
+        },
+      };
+    }
+
+    const reason =
+      finishReason === 'length'
+        ? ({ kind: 'max-tokens' } as const)
+        : finishReason === 'tool-calls' || finishReason === 'tool_calls' || sawToolCall
+          ? ({ kind: 'tool-calls' } as const)
+          : ({ kind: 'stop' } as const);
+    yield { type: 'finish', reason };
   }
 
   /**

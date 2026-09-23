@@ -57,5 +57,33 @@ check('no old go import path in gateway', gwGo.length === 0, gwGo.slice(0, 5).jo
 
 check('example api_key is placeholder test_key', JSON.parse(read('gateway/config.example.json')).api_key === 'test_key');
 
+// ── Provider set lock ────────────────────────────────────────────────────────
+// The README claims a specific set of upstreams. Assert that every module it
+// names is really present AND actually imported by adapter.ts (so a doc claim
+// can never drift from the code), and that retired upstreams stay retired.
+const adapter = read('src/adapter.ts');
+const UPSTREAM_MODULES = [
+  'codex', 'commandcode', 'groq', 'intl-direct', 'llm7', 'nine-router', 'openrouter', 'qoder', 'zcode', 'zhipu',
+];
+for (const m of UPSTREAM_MODULES) {
+  check(`upstream module src/${m}.ts exists`, fs.existsSync(path.join(ROOT, 'src', `${m}.ts`)));
+  check(`src/${m}.ts is imported by adapter.ts`, adapter.includes(`'./${m}.js'`));
+}
+// CodeArts + the WorkBuddy gateway are implemented inside adapter.ts itself.
+check('adapter.ts implements the CodeArts upstream', adapter.includes('CODEARTS_API_URL') && adapter.includes('signRequestHuawei'));
+check('adapter.ts implements the WorkBuddy gateway upstream', adapter.includes('workbuddyGatewayStream'));
+// Every routing prefix the README documents must exist.
+for (const p of ['OPENROUTER_PREFIX', 'LLM7_PREFIX', 'GROQ_PREFIX', 'ZHIPU_PREFIX']) {
+  check(`adapter.ts defines ${p}`, adapter.includes(`export const ${p} =`));
+}
+check('nine-router.ts defines 9r/ prefix', read('src/nine-router.ts').includes("NINE_ROUTER_PREFIX = '9r/'"));
+check('zcode.ts defines zcode/ prefix', read('src/zcode.ts').includes("ZCODE_PREFIX = 'zcode/'"));
+check('adapter.ts defines the cc/ prefix', adapter.includes("COMMANDCODE_PREFIX = 'cc/'"));
+check('adapter.ts routes CommandCode in stream()', adapter.includes('this.commandCodeStream(options)'));
+check('README documents CommandCode Go', read('README.md').includes('Command Code Go'));
+// Retired upstream must not come back as a live module.
+check('retired MiMo module is absent', !fs.existsSync(path.join(ROOT, 'src/mimo.ts')));
+check('retired MiMo is not imported by adapter.ts', !adapter.includes("'./mimo.js'"));
+
 if (failures > 0) { console.error(`contracts FAILED (${failures})`); process.exit(1); }
 console.log('contracts OK.');

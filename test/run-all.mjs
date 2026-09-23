@@ -42,6 +42,15 @@ function localTsc() {
 await step('no-secrets', process.execPath, ['test/no-secrets.mjs', ROOT]);
 await step('contracts', process.execPath, ['test/contracts.mjs']);
 
+// Runtime unit tests need lib/ built; run them only when it exists.
+const libReady = fs.existsSync(path.join(ROOT, 'lib', 'commandcode.js'));
+if (libReady) {
+  await step('commandcode unit', process.execPath, ['test/commandcode.test.mjs']);
+} else {
+  skips++;
+  console.log('skip: commandcode unit (run `pnpm run build` first)');
+}
+
 const tsc = localTsc();
 if (tsc) {
   await step('tsc typecheck', tsc.cmd, [...tsc.args, '-p', 'tsconfig.json', '--noEmit']);
