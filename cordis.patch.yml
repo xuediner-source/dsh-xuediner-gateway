@@ -1,0 +1,4 @@
+# dsh-xuediner-gateway layer: insert the plugin row into the empty profile root.
+- insert:
+    - id: xuediner-gateway
+      name: 'dsh-xuediner-gateway'

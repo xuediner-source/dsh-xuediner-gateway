@@ -1,0 +1,67 @@
+{
+  "name": "dsh-xuediner-gateway",
+  "version": "0.2.0",
+  "description": "DSH plugin: unified xuedinerAPI provider — Huawei CodeArts, Tencent WorkBuddy/CodeBuddy pool (via bundled gateway), ZCode, Qoder Codex and more.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "client",
+    "scripts",
+    "gateway",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "pnpm build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pool": "node scripts/pool-report.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xuediner-source/dsh-xuediner-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xuediner-source/dsh-xuediner-gateway/issues"
+  },
+  "homepage": "https://github.com/xuediner-source/dsh-xuediner-gateway#readme",
+  "keywords": ["dsh", "deepseek-harness", "codearts", "workbuddy", "codebuddy", "zcode", "qoder", "codex", "gateway"],
+  "dependencies": {
+    "jose": "^6.2.12"
+  }
+}
